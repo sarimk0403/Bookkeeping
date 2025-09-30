@@ -1,6 +1,9 @@
-.venv
+# virtual environment
+.venv/
 __pycache__/
+
+# local uploads (not used anymore but keep ignored)
 uploads/
-*.sqlite
-*.db
+
+# secrets
 .env

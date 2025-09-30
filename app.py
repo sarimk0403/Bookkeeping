@@ -1,43 +1,475 @@
-# Simple Bookkeeping Web App – with Admin Dashboard
-# Stack: Flask (Python), SQLite (built-in), local file storage for receipts/images
-# One-file app for quick internal use.
-# ------------------------------------------------------------
-# Quick start:
-#   1) python3 -m venv .venv && source .venv/bin/activate
-#   2) pip install flask python-dotenv
-#   3) python app.py
-#   4) Visit http://127.0.0.1:5000
-# ------------------------------------------------------------
-
 import os
 import csv
-import sqlite3
-import secrets
-from datetime import datetime, date
-from werkzeug.utils import secure_filename
+from io import BytesIO
+from datetime import datetime, timezone, timedelta
+
 from flask import (
-    Flask, request, redirect, url_for, render_template_string, send_from_directory,
-    send_file, flash, session
+    Flask, request, redirect, url_for, render_template_string,
+    flash, session, send_file, Response, abort
 )
 from jinja2 import DictLoader
 
-APP_TITLE = "Internal Bookkeeping"
-DB_PATH = os.environ.get("DB_PATH", "expenses.db")
-UPLOAD_DIR = os.environ.get("UPLOAD_DIR", "uploads")
-ALLOWED_EXT = {"png", "jpg", "jpeg", "pdf"}
-# Optional: simple shared password for internal use
-APP_USERNAME = os.environ.get("APP_USERNAME", "Sarimk0403")
-APP_PASSWORD = os.environ.get("APP_PASSWORD", "Sarimk@2003")
+from pymongo import MongoClient, ASCENDING, DESCENDING
+from bson.objectid import ObjectId
+import gridfs
 
-os.makedirs(UPLOAD_DIR, exist_ok=True)
+from dotenv import load_dotenv
+load_dotenv()
+
+
+try:
+    from werkzeug.utils import secure_filename
+except Exception:
+    def secure_filename(x): return x
+
+# ------------------------------
+# App config / Auth
+# ------------------------------
+APP_TITLE = "Bookkeeping"
+ALLOWED_EXT = {"png", "jpg", "jpeg", "pdf"}
 
 app = Flask(__name__)
-app.config["SECRET_KEY"] = os.environ.get("SECRET_KEY", secrets.token_hex(16))
-app.config["MAX_CONTENT_LENGTH"] = 25 * 1024 * 1024  # 25 MB uploads
+app.secret_key = os.environ.get("SECRET_KEY", os.urandom(24))
 
+APP_USERNAME = os.environ.get("APP_USERNAME", "admin")
+APP_PASSWORD = os.environ.get("APP_PASSWORD", "changeme")
 
-# If you prefer not to create templates/base.html on disk,
-# you can uncomment these two lines to provide it in-memory instead:
+# ------------------------------
+# MongoDB / GridFS (Atlas)
+# ------------------------------
+MONGODB_URI = os.environ.get("MONGODB_URI")  # mongodb+srv://... (Atlas Drivers > Python)
+MONGODB_DB = os.environ.get("MONGODB_DB", "bookkeeping")
+if not MONGODB_URI:
+    raise RuntimeError("Set MONGODB_URI in environment")
+
+mongo_client = MongoClient(MONGODB_URI)
+mdb = mongo_client[MONGODB_DB]
+expenses_col = mdb["expenses"]
+fs = gridfs.GridFS(mdb)
+
+# Helpful indexes (idempotent)
+expenses_col.create_index([("date", DESCENDING)])
+expenses_col.create_index([("category", ASCENDING)])
+expenses_col.create_index([("amount", DESCENDING)])
+expenses_col.create_index([("vendor", ASCENDING)])
+
+# ------------------------------
+# Helpers
+# ------------------------------
+def allowed_file(filename: str) -> bool:
+    return "." in filename and filename.rsplit(".", 1)[1].lower() in ALLOWED_EXT
+
+def _oid(id_str):
+    try:
+        return ObjectId(id_str)
+    except Exception:
+        abort(404)
+
+def _parse_date(s):
+    if not s:
+        return None
+    return datetime.strptime(s, "%Y-%m-%d").replace(tzinfo=timezone.utc)
+
+def _now_utc():
+    return datetime.now(timezone.utc)
+
+def _serialize_expense(doc):
+    """Convert Mongo doc to template-friendly dict and format date."""
+    d = dict(doc)
+    d["id"] = str(d.pop("_id"))
+    if d.get("receipt_id"):
+        d["receipt_id"] = str(d["receipt_id"])
+    # Ensure keys expected by templates exist
+    d["vendor"] = d.get("vendor", "")
+    d["category"] = d.get("category", "")
+    d["notes"] = d.get("notes", "")
+    # Format date for <input type="date"> and table display
+    if isinstance(d.get("date"), datetime):
+        d["date"] = d["date"].strftime("%Y-%m-%d")
+    return d
+
+def _save_receipt(file_storage):
+    """Save uploaded file to GridFS; return ObjectId or None."""
+    if not file_storage or not getattr(file_storage, "filename", ""):
+        return None
+    if not allowed_file(file_storage.filename):
+        return None
+    filename = secure_filename(file_storage.filename)
+    content = file_storage.read()
+    return fs.put(
+        content,
+        filename=filename,
+        content_type=file_storage.mimetype or "application/octet-stream",
+        uploadDate=_now_utc(),
+    )
+
+def _delete_receipt(receipt_id):
+    if not receipt_id:
+        return
+    try:
+        fs.delete(receipt_id)
+    except Exception:
+        pass
+
+def require_login(f):
+    from functools import wraps
+    @wraps(f)
+    def wrapper(*args, **kwargs):
+        if not session.get("authed"):
+            return redirect(url_for("login", next=request.path))
+        return f(*args, **kwargs)
+    return wrapper
+
+# ------------------------------
+# Auth routes
+# ------------------------------
+@app.route("/login", methods=["GET", "POST"])
+def login():
+    if request.method == "POST":
+        u = request.form.get("username", "")
+        p = request.form.get("password", "")
+        if u == APP_USERNAME and p == APP_PASSWORD:
+            session["authed"] = True
+            nxt = request.args.get("next") or url_for("index")
+            return redirect(nxt)
+        flash("Invalid credentials.", "error")
+        return redirect(url_for("login"))
+    return render_template_string(LOGIN_TEMPLATE, title=APP_TITLE, css=BASE_CSS)
+
+@app.route("/logout")
+@require_login
+def logout():
+    session.clear()
+    return redirect(url_for("login"))
+
+# ------------------------------
+# Dashboard
+# ------------------------------
+@app.route("/")
+@app.route("/dashboard")
+@require_login
+def index():
+    # Total spend
+    total_doc = list(expenses_col.aggregate([
+        {"$group": {"_id": None, "sum": {"$sum": "$amount"}}}
+    ]))
+    total = total_doc[0]["sum"] if total_doc else 0.0
+
+    # This month spend
+    now = _now_utc()
+    month_start = now.replace(day=1, hour=0, minute=0, second=0, microsecond=0)
+    next_month = (month_start.replace(day=28) + timedelta(days=4)).replace(day=1)
+    tm_doc = list(expenses_col.aggregate([
+        {"$match": {"date": {"$gte": month_start, "$lt": next_month}}},
+        {"$group": {"_id": None, "sum": {"$sum": "$amount"}}}
+    ]))
+    this_month = tm_doc[0]["sum"] if tm_doc else 0.0
+
+    # Top 5 categories by spend
+    top_cats = list(expenses_col.aggregate([
+        {"$group": {"_id": "$category", "sum": {"$sum": "$amount"}}},
+        {"$sort": {"sum": -1}},
+        {"$limit": 5}
+    ]))
+    top_categories = [{"category": (x["_id"] or "Uncategorized"), "sum": x["sum"]} for x in top_cats]
+
+    # Recent 10
+    recent = expenses_col.find({}).sort("date", DESCENDING).limit(10)
+    recent_rows = [_serialize_expense(d) for d in recent]
+
+    return render_template_string(
+        DASHBOARD_TEMPLATE,
+        title=APP_TITLE,
+        css=BASE_CSS,
+        total=total,
+        this_month=this_month,
+        top_categories=top_categories,
+        recent=recent_rows
+    )
+
+# ------------------------------
+# Expenses list + filters
+# ------------------------------
+@app.route("/expenses")
+@require_login
+def expenses():
+    start = request.args.get("start") or ""
+    end = request.args.get("end") or ""
+    category = request.args.get("category") or ""
+    search = request.args.get("search") or ""
+
+    q = {}
+    if category:
+        q["category"] = category
+
+    start_dt = _parse_date(start)
+    end_dt = _parse_date(end)
+    if start_dt or end_dt:
+        q["date"] = {}
+        if start_dt:
+            q["date"]["$gte"] = start_dt
+        if end_dt:
+            q["date"]["$lt"] = (end_dt + timedelta(days=1))  # inclusive to end-of-day
+
+    if search:
+        q["$or"] = [
+            {"vendor": {"$regex": search, "$options": "i"}},
+            {"notes": {"$regex": search, "$options": "i"}},
+        ]
+
+    cursor = expenses_col.find(q).sort("date", DESCENDING)
+    rows = [_serialize_expense(d) for d in cursor]
+
+    # filtered total
+    ftotal_doc = list(expenses_col.aggregate([
+        {"$match": q},
+        {"$group": {"_id": None, "sum": {"$sum": "$amount"}}}
+    ]))
+    filtered_total = ftotal_doc[0]["sum"] if ftotal_doc else 0.0
+
+    # category list for dropdown
+    cats = expenses_col.distinct("category")
+    cats = sorted([c for c in cats if c], key=lambda x: x.lower())
+
+    filters = {"start": start, "end": end, "category": category, "search": search}
+
+    return render_template_string(
+        INDEX_TEMPLATE,
+        title=APP_TITLE,
+        css=BASE_CSS,
+        rows=rows,
+        total=filtered_total,
+        categories=cats,
+        filters=filters
+    )
+
+# ------------------------------
+# Add expense
+# ------------------------------
+@app.route("/add", methods=["GET", "POST"])
+@require_login
+def add():
+    if request.method == "POST":
+        date_str = request.form.get("date")
+        vendor = (request.form.get("vendor") or "").strip()
+        category = (request.form.get("category") or "").strip()
+        amount = (request.form.get("amount") or "").strip()
+        notes = (request.form.get("notes") or "").strip()
+
+        try:
+            amount_val = float(amount)
+        except ValueError:
+            flash("Amount must be a number.", "error")
+            return redirect(url_for("add"))
+
+        date_dt = _parse_date(date_str) or _now_utc()
+
+        # Receipt to GridFS
+        receipt_file = request.files.get("receipt")
+        receipt_oid = _save_receipt(receipt_file)
+
+        doc = {
+            "date": date_dt,
+            "vendor": vendor,
+            "category": category,
+            "amount": amount_val,
+            "notes": notes,
+            "created_at": _now_utc(),
+            "updated_at": _now_utc(),
+        }
+        if receipt_oid:
+            doc["receipt_id"] = receipt_oid
+
+        expenses_col.insert_one(doc)
+        flash("Expense added.", "success")
+        return redirect(url_for("expenses"))
+
+    return render_template_string(ADD_TEMPLATE, title=APP_TITLE, css=BASE_CSS)
+
+# ------------------------------
+# Edit expense
+# ------------------------------
+@app.route("/edit/<expense_id>", methods=["GET", "POST"])
+@require_login
+def edit(expense_id):
+    oid = _oid(expense_id)
+    doc = expenses_col.find_one({"_id": oid})
+    if not doc:
+        abort(404)
+
+    if request.method == "POST":
+        date_str = request.form.get("date") or None
+        vendor = (request.form.get("vendor") or doc.get("vendor") or "").strip()
+        category = (request.form.get("category") or doc.get("category") or "").strip()
+        amount = (request.form.get("amount") or doc.get("amount") or "").strip()
+        notes = (request.form.get("notes") or doc.get("notes") or "").strip()
+
+        try:
+            amount_val = float(amount)
+        except ValueError:
+            flash("Amount must be a number.", "error")
+            return redirect(url_for("edit", expense_id=expense_id))
+
+        date_dt = _parse_date(date_str) if date_str else (doc.get("date") or _now_utc())
+
+        set_fields = {
+            "date": date_dt,
+            "vendor": vendor,
+            "category": category,
+            "amount": amount_val,
+            "notes": notes,
+            "updated_at": _now_utc(),
+        }
+
+        # Optional receipt replacement
+        receipt_file = request.files.get("receipt")
+        if receipt_file and receipt_file.filename:
+            new_oid = _save_receipt(receipt_file)
+            if doc.get("receipt_id"):
+                _delete_receipt(doc["receipt_id"])
+            set_fields["receipt_id"] = new_oid
+
+        expenses_col.update_one({"_id": oid}, {"$set": set_fields})
+        flash("Expense updated.", "success")
+        return redirect(url_for("expenses"))
+
+    return render_template_string(EDIT_TEMPLATE, title=APP_TITLE, css=BASE_CSS, row=_serialize_expense(doc))
+
+# ------------------------------
+# Delete expense
+# ------------------------------
+@app.route("/delete/<expense_id>", methods=["POST"])
+@require_login
+def delete(expense_id):
+    oid = _oid(expense_id)
+    doc = expenses_col.find_one({"_id": oid})
+    if not doc:
+        abort(404)
+
+    if doc.get("receipt_id"):
+        _delete_receipt(doc["receipt_id"])
+
+    expenses_col.delete_one({"_id": oid})
+    flash("Expense deleted.", "success")
+    return redirect(url_for("expenses"))
+
+# ------------------------------
+# Stream receipt from GridFS
+# ------------------------------
+@app.route("/receipts/<id>")
+@require_login
+def receipts(id):
+    oid = _oid(id)
+    try:
+        gfile = fs.get(oid)
+    except Exception:
+        abort(404)
+    data = gfile.read()
+    return send_file(
+        BytesIO(data),
+        mimetype=(getattr(gfile, "content_type", None) or "application/octet-stream"),
+        download_name=(getattr(gfile, "filename", None) or f"receipt_{id}"),
+        as_attachment=False,
+        max_age=0,
+        conditional=False
+    )
+
+# ------------------------------
+# CSV export
+# ------------------------------
+@app.route("/export.csv")
+@require_login
+def export_csv():
+    # Same filters as /expenses
+    start = request.args.get("start") or ""
+    end = request.args.get("end") or ""
+    category = request.args.get("category") or ""
+    search = request.args.get("search") or ""
+
+    q = {}
+    if category:
+        q["category"] = category
+
+    start_dt = _parse_date(start)
+    end_dt = _parse_date(end)
+    if start_dt or end_dt:
+        q["date"] = {}
+        if start_dt:
+            q["date"]["$gte"] = start_dt
+        if end_dt:
+            q["date"]["$lt"] = (end_dt + timedelta(days=1))
+
+    if search:
+        q["$or"] = [
+            {"vendor": {"$regex": search, "$options": "i"}},
+            {"notes": {"$regex": search, "$options": "i"}},
+        ]
+
+    cursor = expenses_col.find(q).sort("date", DESCENDING)
+
+    def generate():
+        yield "id,date,vendor,category,amount,notes,receipt_id,created_at\n"
+        for d in cursor:
+            created = d.get("created_at")
+            created_s = created.isoformat() if isinstance(created, datetime) else (created or "")
+            date_s = d.get("date").strftime("%Y-%m-%d") if isinstance(d.get("date"), datetime) else (d.get("date") or "")
+            row = [
+                str(d["_id"]),
+                date_s,
+                d.get("vendor", "") or "",
+                d.get("category", "") or "",
+                f'{d.get("amount", 0):.2f}',
+                (d.get("notes", "").replace("\n", " ").replace(",", " ")),
+                (str(d.get("receipt_id")) if d.get("receipt_id") else ""),
+                created_s,
+            ]
+            yield ",".join(row) + "\n"
+
+    headers = {
+        "Content-Disposition": "attachment; filename=expenses_export.csv",
+        "Content-Type": "text/csv; charset=utf-8",
+    }
+    return Response(generate(), headers=headers)
+
+# ------------------------------
+# Inline CSS / Templates
+# ------------------------------
+BASE_CSS = """
+:root { --bg:#0b1020; --card:#131a2e; --muted:#9fb0d3; --accent:#6ea8fe; }
+*{ box-sizing:border-box; }
+body{ margin:0; font-family:system-ui,-apple-system,Segoe UI,Roboto,Ubuntu; background:var(--bg); color:#e6eefc; }
+.container{ max-width:1100px; margin:40px auto; padding:0 16px; }
+a{ color:var(--accent); text-decoration:none; }
+nav{ display:flex; justify-content:space-between; align-items:center; margin-bottom:18px; }
+.header-title{ font-weight:800; font-size:20px; letter-spacing:0.3px; }
+.card{ background:var(--card); border:1px solid #1e2743; border-radius:14px; padding:16px; box-shadow:0 10px 30px rgba(0,0,0,0.25); }
+.btn{ display:inline-block; padding:10px 14px; border-radius:10px; border:1px solid #304377; background:#203057; color:#e6eefc; cursor:pointer; }
+.btn.primary{ background:var(--accent); color:#0b1020; border:0; }
+.btn.danger{ background:#e55353; border:0; }
+input,select,textarea{ width:100%; padding:10px 12px; background:#0f1530; color:#e6eefc; border:1px solid #2c3e70; border-radius:10px; }
+label{ color:#bcd0f0; font-size:14px; }
+.grid{ display:grid; gap:12px; }
+.grid.cols-4{ grid-template-columns: repeat(4, 1fr); }
+.grid.cols-2{ grid-template-columns: 1fr 1fr; }
+.kpis{ display:grid; grid-template-columns: repeat(3, minmax(0,1fr)); gap:12px; margin-bottom:12px; }
+.kpi{ background:#10183a; border:1px solid #22376f; border-radius:14px; padding:14px; }
+.kpi .label{ color:#9fb0d3; font-size:13px; }
+.kpi .value{ font-size:24px; font-weight:800; margin-top:6px; }
+.table{ width:100%; border-collapse:collapse; }
+.table th, table td{ border-bottom:1px solid #25345e; padding:10px; text-align:left; vertical-align:top; }
+.table th{ color:#a8b9df; font-weight:600; }
+.badge{ background:#17244a; border:1px solid #2a3e76; padding:4px 8px; border-radius:999px; font-size:12px; }
+.flash{ margin:8px 0; padding:10px 12px; border-radius:8px; background:#132141; border:1px solid #234; }
+.flash.error{ background:#3a1620; border-color:#6a1f31; }
+.section-title{ color:#9fb0d3; font-size:13px; margin:4px 0 6px; text-transform:uppercase; letter-spacing:.08em; }
+.footer{ color:#8aa0cf; font-size:12px; margin-top:16px; text-align:center; opacity:.85; }
+.table-wrap{ overflow-x:auto; }
+@media (max-width: 720px){
+  .grid.cols-4{ grid-template-columns: 1fr 1fr; }
+  .kpis{ grid-template-columns: 1fr; }
+}
+"""
+
 BASE_TMPL = """
 <!doctype html>
 <html>
@@ -79,9 +511,8 @@ BASE_TMPL = """
 </html>
 """
 
-
-# Uncomment the next line if you are NOT creating templates/base.html on disk
-# app.jinja_loader = DictLoader({"base.html": BASE_TMPL})
+# Provide base.html from memory so no templates/ folder is required
+app.jinja_loader = DictLoader({"base.html": BASE_TMPL})
 
 LOGIN_TEMPLATE = """
 <!doctype html>
@@ -109,425 +540,75 @@ LOGIN_TEMPLATE = """
           <button class="btn primary" type="submit">Login</button>
         </div>
       </form>
-      <div class="footer">Set APP_PASSWORD env var to change the password.</div>
+      <div class="footer">Set APP_USERNAME / APP_PASSWORD env vars.</div>
     </div>
   </div>
 </body>
 </html>
 """
 
-
-def db_conn():
-    conn = sqlite3.connect(DB_PATH)
-    conn.row_factory = sqlite3.Row
-    return conn
-
-
-def init_db():
-    with db_conn() as conn:
-        conn.execute(
-            """
-            CREATE TABLE IF NOT EXISTS expenses (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                date TEXT NOT NULL,
-                vendor TEXT,
-                category TEXT,
-                amount REAL NOT NULL,
-                notes TEXT,
-                receipt_filename TEXT,
-                created_at TEXT NOT NULL DEFAULT (datetime('now'))
-            )
-            """
-        )
-
-init_db()
-
-# ------------------------------
-# Helpers
-# ------------------------------
-
-def allowed_file(filename: str) -> bool:
-    return "." in filename and filename.rsplit(".", 1)[1].lower() in ALLOWED_EXT
-
-
-def require_login(f):
-    from functools import wraps
-
-    @wraps(f)
-    def wrapper(*args, **kwargs):
-        if not session.get("authed"):
-            return redirect(url_for("login", next=request.path))
-        return f(*args, **kwargs)
-
-    return wrapper
-
-
-# ------------------------------
-# Auth (very simple shared password)
-# ------------------------------
-@app.route("/login", methods=["GET", "POST"])
-def login():
-    if request.method == "POST":
-        user = (request.form.get("username") or "").strip()
-        pw = request.form.get("password", "")
-        if user == APP_USERNAME and pw == APP_PASSWORD:
-            session["authed"] = True
-            session["user"] = user
-            flash("Logged in.", "success")
-            return redirect(request.args.get("next") or url_for("index"))
-        else:
-            flash("Incorrect username or password.", "error")
-    return render_template_string(LOGIN_TEMPLATE, title=APP_TITLE)
-
-
-@app.route("/logout")
-@require_login
-def logout():
-    session.clear()
-    flash("Logged out.", "success")
-    return redirect(url_for("login"))
-
-
-# ------------------------------
-# Dashboard (now the default route)
-# ------------------------------
-@app.route("/")
-@require_login
-def index():
-    # Date helpers for current month
-    today = date.today()
-    month_start = today.replace(day=1).strftime("%Y-%m-%d")
-
-    with db_conn() as conn:
-        total_all = conn.execute("SELECT COALESCE(SUM(amount),0) FROM expenses").fetchone()[0] or 0
-        total_month = conn.execute(
-            "SELECT COALESCE(SUM(amount),0) FROM expenses WHERE date(date) >= date(?)",
-            (month_start,),
-        ).fetchone()[0] or 0
-        count_all = conn.execute("SELECT COUNT(*) FROM expenses").fetchone()[0]
-        by_cat = conn.execute(
-            "SELECT COALESCE(category,'Uncategorized') AS category, SUM(amount) AS total\n"
-            "FROM expenses GROUP BY COALESCE(category,'Uncategorized')\n"
-            "ORDER BY total DESC LIMIT 6"
-        ).fetchall()
-        recent = conn.execute(
-            "SELECT id,date,vendor,category,amount,receipt_filename FROM expenses\n"
-            "ORDER BY date DESC, id DESC LIMIT 6"
-        ).fetchall()
-
-    return render_template_string(DASHBOARD_TEMPLATE,
-        title=APP_TITLE,
-        total_all=total_all,
-        total_month=total_month,
-        count_all=count_all,
-        by_cat=by_cat,
-        recent=recent,
-    )
-
-@app.route('/service-worker.js')
-def sw(): return send_from_directory('static','service-worker.js')
-
-
-
-# ------------------------------
-# Expenses list (moved from index to /expenses)
-# ------------------------------
-@app.route("/expenses")
-@require_login
-def expenses():
-    q = []
-    params = []
-
-    # Filters
-    start = request.args.get("start")
-    end = request.args.get("end")
-    category = request.args.get("category")
-    search = request.args.get("search")
-
-    if start:
-        q.append("date(date) >= date(?)")
-        params.append(start)
-    if end:
-        q.append("date(date) <= date(?)")
-        params.append(end)
-    if category:
-        q.append("category = ?")
-        params.append(category)
-    if search:
-        q.append("(vendor LIKE ? OR notes LIKE ?)")
-        like = f"%{search}%"
-        params.extend([like, like])
-
-    where = ("WHERE " + " AND ".join(q)) if q else ""
-    order = "ORDER BY date DESC, id DESC"
-
-    with db_conn() as conn:
-        rows = conn.execute(f"SELECT * FROM expenses {where} {order}", params).fetchall()
-        total = conn.execute(f"SELECT COALESCE(SUM(amount),0) AS t FROM expenses {where}", params).fetchone()[0]
-        cats = conn.execute("SELECT DISTINCT category FROM expenses ORDER BY category").fetchall()
-
-    return render_template_string(INDEX_TEMPLATE, title=APP_TITLE, rows=rows, total=total, filters={
-        "start": start or "",
-        "end": end or "",
-        "category": category or "",
-        "search": search or "",
-    }, categories=[c[0] for c in cats])
-
-
-@app.route("/add", methods=["GET", "POST"])
-@require_login
-def add():
-    if request.method == "POST":
-        date_str = request.form.get("date") or datetime.now().strftime("%Y-%m-%d")
-        vendor = request.form.get("vendor", "").strip()
-        category = request.form.get("category", "").strip()
-        amount = request.form.get("amount", "0").strip()
-        notes = request.form.get("notes", "").strip()
-
-        # Validate fields
-        try:
-            amount_val = float(amount)
-        except ValueError:
-            flash("Amount must be a number.", "error")
-            return redirect(url_for("add"))
-
-        filename = None
-        file = request.files.get("receipt")
-        if file and file.filename:
-            if not allowed_file(file.filename):
-                flash("Invalid file type. Allowed: png, jpg, jpeg, pdf.", "error")
-                return redirect(url_for("add"))
-            safe = secure_filename(file.filename)
-            filename = f"{int(datetime.now().timestamp())}_{safe}"
-            file.save(os.path.join(UPLOAD_DIR, filename))
-
-        with db_conn() as conn:
-            conn.execute(
-                "INSERT INTO expenses (date, vendor, category, amount, notes, receipt_filename) VALUES (?,?,?,?,?,?)",
-                (date_str, vendor, category, float(amount_val), notes, filename),
-            )
-        flash("Expense added.", "success")
-        return redirect(url_for("expenses"))
-
-    return render_template_string(ADD_TEMPLATE, title=APP_TITLE, today=datetime.now().strftime("%Y-%m-%d"))
-
-
-
-@app.route("/delete/<int:expense_id>", methods=["POST"]) 
-@require_login
-def delete(expense_id):
-    with db_conn() as conn:
-        row = conn.execute("SELECT receipt_filename FROM expenses WHERE id=?", (expense_id,)).fetchone()
-        if row:
-            if row[0]:
-                try:
-                    os.remove(os.path.join(UPLOAD_DIR, row[0]))
-                except FileNotFoundError:
-                    pass
-            conn.execute("DELETE FROM expenses WHERE id=?", (expense_id,))
-            flash("Deleted.", "success")
-        else:
-            flash("Not found.", "error")
-    return redirect(url_for("expenses"))
-
-
-@app.route("/receipts/<path:filename>")
-@require_login
-def receipts(filename):
-    return send_from_directory(UPLOAD_DIR, filename)
-
-@app.route("/edit/<int:expense_id>", methods=["GET", "POST"])
-@require_login
-def edit(expense_id):
-    with db_conn() as conn:
-        row = conn.execute("SELECT * FROM expenses WHERE id=?", (expense_id,)).fetchone()
-        if not row:
-            flash("Expense not found.", "error")
-            return redirect(url_for("expenses"))
-
-    if request.method == "POST":
-        date_str = request.form.get("date") or row["date"]
-        vendor = (request.form.get("vendor") or "").strip()
-        category = (request.form.get("category") or "").strip()
-        amount = (request.form.get("amount") or "").strip()
-        notes = (request.form.get("notes") or "").strip()
-
-        try:
-            amount_val = float(amount)
-        except ValueError:
-            flash("Amount must be a number.", "error")
-            return redirect(url_for("edit", expense_id=expense_id))
-
-        filename = row["receipt_filename"]
-        file = request.files.get("receipt")
-        if file and file.filename:
-            if not allowed_file(file.filename):
-                flash("Invalid file type.", "error")
-                return redirect(url_for("edit", expense_id=expense_id))
-            safe = secure_filename(file.filename)
-            filename = f"{int(datetime.now().timestamp())}_{safe}"
-            file.save(os.path.join(UPLOAD_DIR, filename))
-
-        with db_conn() as conn:
-            conn.execute(
-                "UPDATE expenses SET date=?, vendor=?, category=?, amount=?, notes=?, receipt_filename=? WHERE id=?",
-                (date_str, vendor, category, amount_val, notes, filename, expense_id),
-            )
-        flash("Expense updated.", "success")
-        return redirect(url_for("expenses"))
-
-    return render_template_string(EDIT_TEMPLATE, title=APP_TITLE, row=row)
-
-
-@app.route("/export.csv")
-@require_login
-def export_csv():
-    # Apply same filters as expenses list
-    q = []
-    params = []
-    start = request.args.get("start")
-    end = request.args.get("end")
-    category = request.args.get("category")
-    search = request.args.get("search")
-
-    if start:
-        q.append("date(date) >= date(?)")
-        params.append(start)
-    if end:
-        q.append("date(date) <= date(?)")
-        params.append(end)
-    if category:
-        q.append("category = ?")
-        params.append(category)
-    if search:
-        q.append("(vendor LIKE ? OR notes LIKE ?)")
-        like = f"%{search}%"
-        params.extend([like, like])
-
-    where = ("WHERE " + " AND ".join(q)) if q else ""
-
-    with db_conn() as conn:
-        rows = conn.execute(f"SELECT date,vendor,category,amount,notes,receipt_filename,created_at FROM expenses {where} ORDER BY date DESC", params).fetchall()
-
-    # Create CSV in-memory
-    tmp = os.path.join("/tmp", f"export_{int(datetime.now().timestamp())}.csv")
-    with open(tmp, "w", newline="", encoding="utf-8") as f:
-        writer = csv.writer(f)
-        writer.writerow(["date","vendor","category","amount","notes","receipt","created_at"])
-        for r in rows:
-            writer.writerow([r[0], r[1], r[2], r[3], r[4], r[5] or "", r[6]])
-
-    return send_file(tmp, as_attachment=True, download_name="expenses_export.csv")
-
-
-# ------------------------------
-# HTML Templates (inline for single-file simplicity)
-# ------------------------------
-BASE_CSS = """
-:root { --bg:#0b1020; --card:#131a2e; --muted:#9fb0d3; --accent:#6ea8fe; }
-*{ box-sizing:border-box; }
-body{ margin:0; font-family:system-ui,-apple-system,Segoe UI,Roboto,Ubuntu; background:var(--bg); color:#e6eefc; }
-.container{ max-width:1100px; margin:40px auto; padding:0 16px; }
-a{ color:var(--accent); text-decoration:none; }
-nav{ display:flex; justify-content:space-between; align-items:center; margin-bottom:18px; }
-.card{ background:var(--card); border:1px solid #1e2743; border-radius:14px; padding:16px; box-shadow:0 10px 30px rgba(0,0,0,0.25); }
-.btn{ display:inline-block; padding:10px 14px; border-radius:10px; border:1px solid #304377; background:#203057; color:#e6eefc; cursor:pointer; }
-.btn.primary{ background:var(--accent); color:#0b1020; border:0; }
-.btn.danger{ background:#e55353; border:0; }
-input,select,textarea{ width:100%; padding:10px 12px; background:#0f1530; color:#e6eefc; border:1px solid #2c3e70; border-radius:10px; }
-label{ color:#bcd0f0; font-size:14px; }
-.grid{ display:grid; gap:12px; }
-.grid.cols-4{ grid-template-columns: repeat(4, 1fr); }
-.grid.cols-2{ grid-template-columns: 1fr 1fr; }
-.kpis{ display:grid; grid-template-columns: repeat(3, minmax(0,1fr)); gap:12px; margin-bottom:12px; }
-.kpi{ background:#10183a; border:1px solid #22376f; border-radius:14px; padding:14px; }
-.kpi .label{ color:#9fb0d3; font-size:13px; }
-.kpi .value{ font-size:24px; font-weight:800; margin-top:6px; }
-.table{ width:100%; border-collapse:collapse; }
-.table th,.table td{ border-bottom:1px solid #25345e; padding:10px; text-align:left; }
-.table th{ color:#a8b9df; font-weight:600; }
-.badge{ padding:4px 8px; background:#1e2a52; border-radius:999px; border:1px solid #2f447f; font-size:12px; color:#bcd0f0; }
-.flash{ padding:10px 12px; border-radius:10px; margin-bottom:12px; }
-.flash.success{ background:#16351e; border:1px solid #2f7f4a; }
-.flash.error{ background:#3a1717; border:1px solid #9b2b2b; }
-.footer{ margin-top:16px; color:#9fb0d3; font-size:13px; }
-.header-title{ font-size:20px; font-weight:700; }
-.section-title{ font-weight:700; margin:10px 0; }
-.actions{ display:flex; gap:8px; }
-/* --- Mobile tweaks --- */
-@media (max-width: 768px) {
-  .container { padding: 0 12px; }
-  .grid { gap: 10px; }
-  .grid.cols-4, .grid.cols-2 { grid-template-columns: 1fr; } /* filters & forms stack */
-  nav { flex-direction: column; align-items: flex-start; gap: 10px; }
-  .btn { width: 100%; min-height: 44px; } /* big, easy tap targets */
-  input, select, textarea { font-size: 16px; } /* avoid iOS zoom on focus */
-  .card { padding: 12px; }
-  .kpis { grid-template-columns: 1fr; } /* dashboard tiles stack */
-  .header-title { font-size: 18px; }
-  .table th, .table td { padding: 8px; font-size: 14px; }
-}
-
-/* Keep navbar visible when scrolling on mobile */
-nav { position: sticky; top: 0; z-index: 20; background: var(--bg); padding-bottom: 8px; }
-
-/* Make tables scroll instead of overflowing the screen */
-.table-wrap { width: 100%; overflow-x: auto; -webkit-overflow-scrolling: touch; }
-.table { min-width: 720px; } /* ensures header/columns keep shape while scrolling */
-
-"""
-
 DASHBOARD_TEMPLATE = """
 {% extends 'base.html' %}
 {% block content %}
-<div class="kpis">
-  <div class="kpi"><div class="label">Total Spent (All Time)</div><div class="value">${{ '%.2f'|format(total_all) }}</div></div>
-  <div class="kpi"><div class="label">Total Spent (This Month)</div><div class="value">${{ '%.2f'|format(total_month) }}</div></div>
-  <div class="kpi"><div class="label"># of Expenses</div><div class="value">{{ count_all }}</div></div>
-</div>
-
-<div class="grid cols-2">
-  <div>
-    <div class="section-title">Top Categories</div>
-        <div class="table-wrap">
-        <table class="table">
-        <thead><tr><th>Category</th><th>Total</th></tr></thead>
-        <tbody>
-            {% for r in by_cat %}
-            <tr><td><span class="badge">{{ r['category'] }}</span></td><td>${{ '%.2f'|format(r['total']) }}</td></tr>
-            {% else %}
-            <tr><td colspan="2">No data yet.</td></tr>
-            {% endfor %}
-        </tbody>
-        </table>
+  <div class="kpis">
+    <div class="kpi">
+      <div class="label">Total Spend</div>
+      <div class="value">${{ '%.2f'|format(total or 0) }}</div>
+    </div>
+    <div class="kpi">
+      <div class="label">This Month</div>
+      <div class="value">${{ '%.2f'|format(this_month or 0) }}</div>
+    </div>
+    <div class="kpi">
+      <div class="label">Top Category</div>
+      <div class="value">
+        {% if top_categories and top_categories[0] %}
+          {{ top_categories[0]['category'] or '—' }} (${{ '%.2f'|format(top_categories[0]['sum']) }})
+        {% else %}—{% endif %}
+      </div>
     </div>
   </div>
-  <div>
-    <div class="section-title">Recent Expenses</div>
-    <div class="table-wrap">
-        <table class="table">
-        <thead><tr><th>Date</th><th>Vendor</th><th>Category</th><th>Amount</th></tr></thead>
-        <tbody>
-            {% for r in recent %}
-            <tr>
-                <td>{{ r['date'] }}</td>
-                <td>{{ r['vendor'] or '-' }}</td>
-                <td><span class="badge">{{ r['category'] or 'Uncategorized' }}</span></td>
-                <td>${{ '%.2f'|format(r['amount']) }}</td>
-            </tr>
-            {% else %}
-            <tr><td colspan="4">No expenses yet.</td></tr>
-            {% endfor %}
-        </tbody>
-        </table>
-    </div>
-  </div>
-</div>
 
-<div class="actions" style="margin-top:12px;">
-  <a class="btn primary" href="{{ url_for('add') }}">+ Add Expense</a>
-  <a class="btn" href="{{ url_for('expenses') }}">View All Expenses</a>
-</div>
+  <div class="section-title">Top 5 Categories</div>
+  <div style="display:grid; gap:8px; grid-template-columns:repeat(5,minmax(0,1fr));">
+    {% for c in top_categories %}
+      <div class="card" style="padding:10px;">
+        <div style="color:#9fb0d3; font-size:12px;">{{ c['category'] or 'Uncategorized' }}</div>
+        <div style="font-weight:700; margin-top:4px;">${{ '%.2f'|format(c['sum']) }}</div>
+      </div>
+    {% else %}
+      <div style="grid-column:1/-1; color:#9fb0d3;">No data.</div>
+    {% endfor %}
+  </div>
+
+  <div class="section-title" style="margin-top:14px;">Recent Expenses</div>
+  <div class="table-wrap">
+    <table class="table">
+      <thead>
+        <tr>
+          <th>Date</th><th>Vendor</th><th>Category</th><th>Amount</th><th>Receipt</th><th>Notes</th>
+        </tr>
+      </thead>
+      <tbody>
+        {% for r in recent %}
+        <tr>
+          <td>{{ r['date'] }}</td>
+          <td>{{ r['vendor'] or '-' }}</td>
+          <td><span class="badge">{{ r['category'] or 'Uncategorized' }}</span></td>
+          <td>${{ '%.2f'|format(r['amount']) }}</td>
+          <td>
+            {% if r['receipt_id'] %}
+              <a href="{{ url_for('receipts', id=r['receipt_id']) }}" target="_blank">View</a>
+            {% else %}-{% endif %}
+          </td>
+          <td>{{ r['notes'] or '' }}</td>
+        </tr>
+        {% else %}
+        <tr><td colspan="6">No recent expenses.</td></tr>
+        {% endfor %}
+      </tbody>
+    </table>
+  </div>
 {% endblock %}
 """
 
@@ -567,49 +648,90 @@ INDEX_TEMPLATE = """
 </form>
 
 <div class="section-title">Filtered Total</div>
-<div style="margin-bottom:10px; font-size:18px; font-weight:700;">${{ '%.2f'|format(total or 0) }}</div>
-<div class="table-wrap">
-    <table class="table">
-    <thead>
-        <tr>
-        <th>Date</th>
-        <th>Vendor</th>
-        <th>Category</th>
-        <th>Amount</th>
-        <th>Receipt</th>
-        <th>Notes</th>
-        <th></th>
-        </tr>
-    </thead>
-    <tbody>
-        {% for r in rows %}
-        <tr>
-        <td>{{ r['date'] }}</td>
-        <td>{{ r['vendor'] or '-' }}</td>
-        <td><span class="badge">{{ r['category'] or 'Uncategorized' }}</span></td>
-        <td>${{ '%.2f'|format(r['amount']) }}</td>
-        <td>
-            {% if r['receipt_filename'] %}
-            <a href="{{ url_for('receipts', filename=r['receipt_filename']) }}" target="_blank">View</a>
-            {% else %}-{% endif %}
-        </td>
-        <td>{{ r['notes'] or '' }}</td>
-        <td>
-            <div style="display:flex; gap:6px; flex-wrap: wrap;">
-                <a class="btn" href="{{ url_for('edit', expense_id=r['id']) }}">Edit</a>
-                <form method="post" action="{{ url_for('delete', expense_id=r['id']) }}" onsubmit="return confirm('Delete this expense?');">
-                <button class="btn danger">Delete</button>
-                </form>
-            </div>
-        </td>
-
-        </tr>
-        {% else %}
-        <tr><td colspan="7">No expenses found.</td></tr>
-        {% endfor %}
-    </tbody>
-    </table>
+<div style="margin-bottom:10px; font-size:18px; font-weight:700;">
+  ${{ '%.2f'|format(total or 0) }}
 </div>
+
+<div class="table-wrap">
+  <table class="table">
+  <thead>
+      <tr>
+      <th>Date</th>
+      <th>Vendor</th>
+      <th>Category</th>
+      <th>Amount</th>
+      <th>Receipt</th>
+      <th>Notes</th>
+      <th></th>
+      </tr>
+  </thead>
+  <tbody>
+      {% for r in rows %}
+      <tr>
+      <td>{{ r['date'] }}</td>
+      <td>{{ r['vendor'] or '-' }}</td>
+      <td><span class="badge">{{ r['category'] or 'Uncategorized' }}</span></td>
+      <td>${{ '%.2f'|format(r['amount']) }}</td>
+      <td>
+          {% if r['receipt_id'] %}
+          <a href="{{ url_for('receipts', id=r['receipt_id']) }}" target="_blank">View</a>
+          {% else %}-{% endif %}
+      </td>
+      <td>{{ r['notes'] or '' }}</td>
+      <td>
+          <div style="display:flex; gap:6px; flex-wrap: wrap;">
+              <a class="btn" href="{{ url_for('edit', expense_id=r['id']) }}">Edit</a>
+              <form method="post" action="{{ url_for('delete', expense_id=r['id']) }}" onsubmit="return confirm('Delete this expense?');">
+                <button class="btn danger">Delete</button>
+              </form>
+          </div>
+      </td>
+      </tr>
+      {% else %}
+      <tr><td colspan="7">No expenses found.</td></tr>
+      {% endfor %}
+  </tbody>
+  </table>
+</div>
+{% endblock %}
+"""
+
+ADD_TEMPLATE = """
+{% extends 'base.html' %}
+{% block content %}
+<h3>Add Expense</h3>
+<form method="post" enctype="multipart/form-data" class="grid cols-2">
+  <div>
+    <label>Date</label>
+    <input type="date" name="date" value="{{ (caller_date or '') }}" required/>
+  </div>
+  <div>
+    <label>Amount (USD)</label>
+    <input type="number" step="0.01" name="amount" required/>
+  </div>
+  <div>
+    <label>Vendor</label>
+    <input type="text" name="vendor" placeholder="Optional"/>
+  </div>
+  <div>
+    <label>Category</label>
+    <input type="text" name="category" placeholder="e.g., Meals, Travel, Tools"/>
+  </div>
+  <div class="grid cols-2">
+    <div>
+      <label>Receipt (png/jpg/jpeg/pdf)</label>
+      <input type="file" name="receipt" accept="image/*,application/pdf"/>
+    </div>
+  </div>
+  <div style="grid-column:1/-1;">
+    <label>Notes</label>
+    <textarea name="notes" rows="3" placeholder="Optional notes"></textarea>
+  </div>
+  <div style="grid-column:1/-1; display:flex; gap:8px; justify-content:flex-end;">
+    <a class="btn" href="{{ url_for('expenses') }}">Cancel</a>
+    <button class="btn primary" type="submit">Save</button>
+  </div>
+</form>
 {% endblock %}
 """
 
@@ -638,9 +760,9 @@ EDIT_TEMPLATE = """
     <div>
       <label>Receipt (upload new to replace)</label>
       <input type="file" name="receipt" accept="image/*,application/pdf"/>
-      {% if row['receipt_filename'] %}
+      {% if row['receipt_id'] %}
         <div style="margin-top:6px;">
-          <a href="{{ url_for('receipts', filename=row['receipt_filename']) }}" target="_blank">Current receipt</a>
+          <a href="{{ url_for('receipts', id=row['receipt_id']) }}" target="_blank">Current receipt</a>
         </div>
       {% endif %}
     </div>
@@ -649,60 +771,17 @@ EDIT_TEMPLATE = """
     <label>Notes</label>
     <textarea name="notes" rows="3">{{ row['notes'] or '' }}</textarea>
   </div>
-  <div style="grid-column:1/-1; display:flex; gap:8px;">
-    <button class="btn primary" type="submit">Save</button>
+  <div style="grid-column:1/-1; display:flex; gap:8px; justify-content:flex-end;">
     <a class="btn" href="{{ url_for('expenses') }}">Cancel</a>
+    <button class="btn primary" type="submit">Save Changes</button>
   </div>
 </form>
 {% endblock %}
 """
 
-
-ADD_TEMPLATE = """
-{% extends 'base.html' %}
-{% block content %}
-<form method="post" enctype="multipart/form-data" class="grid cols-2">
-  <div>
-    <label>Date</label>
-    <input type="date" name="date" value="{{ today }}" required/>
-  </div>
-  <div>
-    <label>Amount (USD)</label>
-    <input type="number" step="0.01" name="amount" placeholder="0.00" required/>
-  </div>
-  <div>
-    <label>Vendor</label>
-    <input type="text" name="vendor" placeholder="Who did we pay?"/>
-  </div>
-  <div>
-    <label>Category</label>
-    <input type="text" name="category" placeholder="e.g., Software, Travel, Supplies"/>
-  </div>
-  <div class="grid cols-2">
-    <div>
-      <label>Receipt (png/jpg/jpeg/pdf)</label>
-      <input type="file" name="receipt" accept="image/*,application/pdf"/>
-    </div>
-  </div>
-  <div style="grid-column:1/-1;">
-    <label>Notes</label>
-    <textarea name="notes" rows="3" placeholder="Optional details"></textarea>
-  </div>
-  <div style="grid-column:1/-1; display:flex; gap:8px;">
-    <button class="btn primary" type="submit">Save</button>
-    <a class="btn" href="{{ url_for('expenses') }}">Cancel</a>
-  </div>
-</form>
-{% endblock %}
-"""
-
-# Jinja context for CSS
-@app.context_processor
-def inject_base():
-    return {"css": BASE_CSS}
-
-
+# ------------------------------
+# Main
+# ------------------------------
 if __name__ == "__main__":
-    print(f"\n{APP_TITLE} running…")
-    print("Env vars: DB_PATH, UPLOAD_DIR, APP_PASSWORD, SECRET_KEY")
-    app.run(debug=True)
+    # For local dev: flask run or python app.py
+    app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 5001)))
