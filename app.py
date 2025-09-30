@@ -1,5 +1,6 @@
 import os
 import csv
+import certifi
 from io import BytesIO
 from datetime import datetime, timezone, timedelta
 
@@ -42,7 +43,12 @@ MONGODB_DB = os.environ.get("MONGODB_DB", "bookkeeping")
 if not MONGODB_URI:
     raise RuntimeError("Set MONGODB_URI in environment")
 
-mongo_client = MongoClient(MONGODB_URI)
+mongo_client = MongoClient(
+    MONGODB_URI,
+    tlsCAFile=certifi.where(),   # 👈 makes SSL work on Render
+    serverSelectionTimeoutMS=30000
+)
+
 mdb = mongo_client[MONGODB_DB]
 expenses_col = mdb["expenses"]
 fs = gridfs.GridFS(mdb)
