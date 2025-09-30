@@ -1,0 +1,43 @@
+<!doctype html>
+<html>
+<head>
+    <link rel="manifest" href="/static/manifest.json">
+    <meta name="apple-mobile-web-app-capable" content="yes">
+    <link rel="apple-touch-icon" href="/static/icons/icon-192.png">
+
+  <meta charset="utf-8"/>
+  <meta name="viewport" content="width=device-width, initial-scale=1"/>
+  <title>{{ title }}</title>
+  <style>{{ css }}</style>
+</head>
+<body>
+  <div class="container">
+    <nav>
+      <div class="header-title">{{ title }}</div>
+      <div>
+        {% if session.get('authed') %}
+        <a href="{{ url_for('index') }}" class="btn">Dashboard</a>
+        <a href="{{ url_for('add') }}" class="btn primary">+ Add Expense</a>
+        <a href="{{ url_for('logout') }}" class="btn">Logout</a>
+        {% endif %}
+      </div>
+    </nav>
+
+    {% with messages = get_flashed_messages(with_categories=true) %}
+      {% if messages %}
+        {% for cat, msg in messages %}
+          <div class="flash {{cat}}">{{ msg }}</div>
+        {% endfor %}
+      {% endif %}
+    {% endwith %}
+
+    <div class="card">
+      {% block content %}{% endblock %}
+    </div>
+
+    <div class="footer">
+      Lightweight internal app. Max upload 25MB. Allowed: png, jpg, jpeg, pdf.
+    </div>
+  </div>
+</body>
+</html>
