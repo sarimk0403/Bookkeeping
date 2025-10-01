@@ -1,24 +1,97 @@
 <!doctype html>
 <html>
 <head>
-    <link rel="manifest" href="/static/manifest.json">
-    <meta name="apple-mobile-web-app-capable" content="yes">
-    <link rel="apple-touch-icon" href="/static/icons/icon-192.png">
+  <link rel="manifest" href="/static/manifest.json">
+  <meta name="apple-mobile-web-app-capable" content="yes">
+  <link rel="apple-touch-icon" href="/static/icons/icon-192.png">
 
   <meta charset="utf-8"/>
   <meta name="viewport" content="width=device-width, initial-scale=1"/>
   <title>{{ title }}</title>
+
+  <!-- Your app-wide CSS from app.py -->
   <style>{{ css }}</style>
+
+  <!-- Responsive navbar + consistent button sizing -->
+  <style>
+    /* NAV LAYOUT */
+    .navbar{
+      display:flex;
+      align-items:center;
+      justify-content:space-between;
+      gap:.75rem;
+      flex-wrap:wrap;           /* allow wrap when vertical space is tight */
+      margin-bottom:18px;
+    }
+    .nav-brand{
+      font-weight:800; font-size:20px; letter-spacing:.3px;
+      white-space:nowrap;
+      flex:0 0 auto;
+    }
+    .nav-actions{
+      display:flex;
+      flex-wrap:wrap;
+      gap:.5rem;
+      justify-content:flex-end;
+      flex:1 1 auto;
+      min-width:260px;
+    }
+
+    /* CONSISTENT BUTTONS */
+    .nav-actions .btn{
+      display:inline-flex;
+      align-items:center;
+      justify-content:center;
+      height:40px;              /* unified height */
+      padding:0 14px;           /* vertical padding now handled by height */
+      font-size:14px;
+      font-weight:600;
+      border-radius:10px;
+      min-width:120px;          /* don't get too tiny on medium screens */
+    }
+
+    /* When the viewport is narrow (or very short), switch to a grid of equal tiles */
+    @media (max-width: 780px){
+      .navbar{
+        position:sticky; top:0; z-index:20; background:var(--bg);
+        padding-top:6px; padding-bottom:4px;
+      }
+      .nav-actions{
+        display:grid;
+        grid-template-columns: repeat(2, minmax(0, 1fr)); /* 2 per row */
+        gap:.5rem;
+        width:100%;
+      }
+      .nav-actions .btn{
+        width:100%;              /* equal width tiles */
+        min-width:0;
+        height:42px;
+      }
+      .nav-brand{ font-size:18px; }
+    }
+
+    /* Super small phones: stack into 1 column */
+    @media (max-width: 420px){
+      .nav-actions{
+        grid-template-columns: 1fr;
+      }
+    }
+
+    /* Safety net for wide tables on short screens */
+    .table-wrap{ overflow-x:auto; -webkit-overflow-scrolling:touch; }
+  </style>
 </head>
 <body>
   <div class="container">
-    <nav>
-      <div class="header-title">{{ title }}</div>
-      <div>
+
+    <nav class="navbar">
+      <div class="nav-brand">{{ title }}</div>
+      <div class="nav-actions">
         {% if session.get('authed') %}
-        <a href="{{ url_for('index') }}" class="btn">Dashboard</a>
-        <a href="{{ url_for('add') }}" class="btn primary">+ Add Expense</a>
-        <a href="{{ url_for('logout') }}" class="btn">Logout</a>
+          <a href="{{ url_for('index') }}" class="btn">Dashboard</a>
+          <a href="{{ url_for('expenses') }}" class="btn">Expenses</a>
+          <a href="{{ url_for('add') }}" class="btn primary">+ Add Expense</a>
+          <a href="{{ url_for('logout') }}" class="btn">Logout</a>
         {% endif %}
       </div>
     </nav>
