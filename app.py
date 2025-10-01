@@ -518,7 +518,7 @@ BASE_TMPL = """
 """
 
 # Provide base.html from memory so no templates/ folder is required
-app.jinja_loader = DictLoader({"base.html": BASE_TMPL})
+
 
 LOGIN_TEMPLATE = """
 <!doctype html>
@@ -587,9 +587,9 @@ DASHBOARD_TEMPLATE = """
     {% endfor %}
   </div>
 
-  <div class="section-title" style="margin-top:14px;">Recent Expenses</div>
+    <div class="section-title" style="margin-top:14px;">Recent Expenses</div>
   <div class="table-wrap">
-    <table class="table">
+    <table class="table cardify">
       <thead>
         <tr>
           <th>Date</th><th>Vendor</th><th>Category</th><th>Amount</th><th>Receipt</th><th>Notes</th>
@@ -598,16 +598,16 @@ DASHBOARD_TEMPLATE = """
       <tbody>
         {% for r in recent %}
         <tr>
-          <td>{{ r['date'] }}</td>
-          <td>{{ r['vendor'] or '-' }}</td>
-          <td><span class="badge">{{ r['category'] or 'Uncategorized' }}</span></td>
-          <td>${{ '%.2f'|format(r['amount']) }}</td>
-          <td>
+          <td data-label="Date">{{ r['date'] }}</td>
+          <td data-label="Vendor">{{ r['vendor'] or '-' }}</td>
+          <td data-label="Category"><span class="badge">{{ r['category'] or 'Uncategorized' }}</span></td>
+          <td data-label="Amount">${{ '%.2f'|format(r['amount']) }}</td>
+          <td data-label="Receipt">
             {% if r['receipt_id'] %}
               <a href="{{ url_for('receipts', id=r['receipt_id']) }}" target="_blank">View</a>
             {% else %}-{% endif %}
           </td>
-          <td>{{ r['notes'] or '' }}</td>
+          <td data-label="Notes">{{ r['notes'] or '' }}</td>
         </tr>
         {% else %}
         <tr><td colspan="6">No recent expenses.</td></tr>
@@ -615,6 +615,7 @@ DASHBOARD_TEMPLATE = """
       </tbody>
     </table>
   </div>
+
 {% endblock %}
 """
 
@@ -622,36 +623,22 @@ INDEX_TEMPLATE = """
 {% extends 'base.html' %}
 {% block content %}
 <form method="get" class="grid cols-4" style="margin-bottom:12px;">
-  <div>
-    <label>Start date</label>
-    <input type="date" name="start" value="{{ filters.start }}"/>
+  <!-- start / end / category / search fields stay the same ... -->
+
+  <!-- ACTIONS: keep Apply + Reset together -->
+  <div class="form-actions">
+    <button class="btn" type="submit">Apply</button>
+    <a class="btn" href="{{ url_for('expenses') }}">Reset</a>
   </div>
-  <div>
-    <label>End date</label>
-    <input type="date" name="end" value="{{ filters.end }}"/>
-  </div>
-  <div>
-    <label>Category</label>
-    <select name="category">
-      <option value="">All</option>
-      {% for c in categories %}
-      <option value="{{c}}" {% if filters.category==c %}selected{% endif %}>{{c}}</option>
-      {% endfor %}
-    </select>
-  </div>
-  <div>
-    <label>Search</label>
-    <input type="text" name="search" placeholder="Vendor or notes…" value="{{ filters.search }}"/>
-  </div>
-  <div>
-    <button class="btn" style="margin-top:28px;">Apply</button>
-    <a class="btn" style="margin-top:28px;" href="{{ url_for('expenses') }}">Reset</a>
-  </div>
-  <div></div><div></div>
-  <div style="display:flex; justify-content:flex-end; align-items:end;">
+
+  <!-- remove the two empty filler divs -->
+
+  <!-- Export on the right (or full-width on mobile) -->
+  <div class="form-export">
     <a class="btn" href="{{ url_for('export_csv', **filters) }}">Export CSV</a>
   </div>
 </form>
+
 
 <div class="section-title">Filtered Total</div>
 <div style="margin-bottom:10px; font-size:18px; font-weight:700;">
@@ -659,7 +646,7 @@ INDEX_TEMPLATE = """
 </div>
 
 <div class="table-wrap">
-  <table class="table">
+  <table class="table cardify">
   <thead>
       <tr>
       <th>Date</th>
@@ -674,25 +661,26 @@ INDEX_TEMPLATE = """
   <tbody>
       {% for r in rows %}
       <tr>
-      <td>{{ r['date'] }}</td>
-      <td>{{ r['vendor'] or '-' }}</td>
-      <td><span class="badge">{{ r['category'] or 'Uncategorized' }}</span></td>
-      <td>${{ '%.2f'|format(r['amount']) }}</td>
-      <td>
-          {% if r['receipt_id'] %}
-          <a href="{{ url_for('receipts', id=r['receipt_id']) }}" target="_blank">View</a>
-          {% else %}-{% endif %}
-      </td>
-      <td>{{ r['notes'] or '' }}</td>
-      <td>
-          <div style="display:flex; gap:6px; flex-wrap: wrap;">
-              <a class="btn" href="{{ url_for('edit', expense_id=r['id']) }}">Edit</a>
-              <form method="post" action="{{ url_for('delete', expense_id=r['id']) }}" onsubmit="return confirm('Delete this expense?');">
-                <button class="btn danger">Delete</button>
-              </form>
-          </div>
-      </td>
+        <td data-label="Date">{{ r['date'] }}</td>
+        <td data-label="Vendor">{{ r['vendor'] or '-' }}</td>
+        <td data-label="Category"><span class="badge">{{ r['category'] or 'Uncategorized' }}</span></td>
+        <td data-label="Amount">${{ '%.2f'|format(r['amount']) }}</td>
+        <td data-label="Receipt">
+            {% if r['receipt_id'] %}
+            <a href="{{ url_for('receipts', id=r['receipt_id']) }}" target="_blank">View</a>
+            {% else %}-{% endif %}
+        </td>
+        <td data-label="Notes">{{ r['notes'] or '' }}</td>
+        <td data-label="Actions">
+            <div class="card-actions">
+            <a class="btn" href="{{ url_for('edit', expense_id=r['id']) }}">Edit</a>
+            <form method="post" action="{{ url_for('delete', expense_id=r['id']) }}" onsubmit="return confirm('Delete this expense?');">
+                <button class="btn danger" type="submit">Delete</button>
+            </form>
+            </div>
+        </td>
       </tr>
+
       {% else %}
       <tr><td colspan="7">No expenses found.</td></tr>
       {% endfor %}
@@ -723,17 +711,20 @@ ADD_TEMPLATE = """
     <label>Category</label>
     <input type="text" name="category" placeholder="e.g., Meals, Travel, Tools"/>
   </div>
-  <div class="grid cols-2">
-    <div>
-      <label>Receipt (png/jpg/jpeg/pdf)</label>
-      <input type="file" name="receipt" accept="image/*,application/pdf"/>
+  <div class="field receipt-row span-2">
+    <label for="receipt">Receipt <span class="muted">(png/jpg/jpeg/pdf)</span></label>
+    <div class="file-control">
+        <input id="receipt" class="file-input" type="file" name="receipt" accept="image/*,application/pdf"/>
     </div>
-  </div>
+    </div>
+
+
   <div style="grid-column:1/-1;">
     <label>Notes</label>
     <textarea name="notes" rows="3" placeholder="Optional notes"></textarea>
   </div>
-  <div style="grid-column:1/-1; display:flex; gap:8px; justify-content:flex-end;">
+
+  <div class="form-actions-bar" style="grid-column:1/-1;">
     <a class="btn" href="{{ url_for('expenses') }}">Cancel</a>
     <button class="btn primary" type="submit">Save</button>
   </div>
@@ -762,17 +753,20 @@ EDIT_TEMPLATE = """
     <label>Category</label>
     <input type="text" name="category" value="{{ row['category'] or '' }}"/>
   </div>
-  <div class="grid cols-2">
-    <div>
-      <label>Receipt (upload new to replace)</label>
-      <input type="file" name="receipt" accept="image/*,application/pdf"/>
-      {% if row['receipt_id'] %}
-        <div style="margin-top:6px;">
-          <a href="{{ url_for('receipts', id=row['receipt_id']) }}" target="_blank">Current receipt</a>
-        </div>
-      {% endif %}
+  <div class="field receipt-row span-2">
+    <label for="receipt-edit">Receipt <span class="muted">(upload new to replace)</span></label>
+    <div class="file-control">
+        <input id="receipt-edit" class="file-input" type="file" name="receipt" accept="image/*,application/pdf"/>
     </div>
-  </div>
+    {% if row['receipt_id'] %}
+        <div class="span-2" style="margin-top:6px;">
+        <a href="{{ url_for('receipts', id=row['receipt_id']) }}" target="_blank">Current receipt</a>
+        </div>
+    {% endif %}
+    </div>
+
+
+    </div>
   <div style="grid-column:1/-1;">
     <label>Notes</label>
     <textarea name="notes" rows="3">{{ row['notes'] or '' }}</textarea>

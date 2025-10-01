@@ -12,10 +12,49 @@
   <!-- Your app-wide CSS from app.py -->
   <style>{{ css }}</style>
 
-  <!-- Mobile-first layout fixes -->
+  <!-- Custom responsive tweaks -->
   <style>
     /* Respect iOS safe-area (Dynamic Island / notch) */
     body { padding-top: max(0px, env(safe-area-inset-top)); }
+
+    @media (max-width: 780px){
+    /* Any table with .cardify becomes stacked cards */
+    table.cardify { border-collapse: separate; border-spacing: 0; width:100%; }
+    table.cardify thead { display: none; }
+    table.cardify tbody, 
+    table.cardify tr, 
+    table.cardify td { display: block; width: 100%; }
+
+    table.cardify tbody tr{
+      background:#10183a; 
+      border:1px solid #22376f;
+      border-radius:14px;
+      padding:10px 12px;
+      margin:10px 0;
+      box-shadow:0 6px 16px rgba(0,0,0,.18);
+    }
+
+    table.cardify td{
+      display:flex; 
+      align-items:flex-start; 
+      justify-content:space-between;
+      gap:10px;
+      padding:6px 0; 
+      border:none; 
+      font-size:14px;
+    }
+
+    /* Left-side label pulled from data-label on each TD */
+    table.cardify td::before{
+      content: attr(data-label);
+      color:#9fb0d3;
+      font-weight:600;
+      flex: 0 0 42%;
+      text-align:left;
+    }
+
+    .card-actions{ display:flex; gap:8px; margin-top:6px; justify-content:flex-end; }
+    .card-actions .btn{ height:38px; padding:0 12px; font-size:14px; }
 
     /* --- NAV: space, equal sizing, and clean wrapping on phones --- */
     .navbar{
@@ -42,17 +81,16 @@
       .nav-brand{ font-size:18px; }
     }
     @media (max-width: 420px){
-      .nav-actions{ grid-template-columns: 1fr; } /* one per row on very small phones */
+      .nav-actions{ grid-template-columns: 1fr; }
     }
 
-    /* --- KPIs: add a touch more spacing on phones --- */
+    /* --- KPIs --- */
     @media (max-width: 780px){
       .kpis{ gap:10px; }
       .kpi .value{ font-size:22px; }
     }
 
-    /* --- Top 5 Categories: convert the inline 5-column grid to a responsive masonry-like grid --- */
-    /* The container immediately after the "Top 5 Categories" title is that grid. */
+    /* --- Top 5 Categories grid --- */
     .section-title + div{
       display:grid !important;
       grid-template-columns: repeat(auto-fit, minmax(140px, 1fr)) !important;
@@ -67,15 +105,139 @@
     .section-title + div .card div:first-child{ font-size:12px; opacity:.85; }
     .section-title + div .card div:last-child{ font-weight:800; font-size:16px; }
 
-    /* --- Tables: keep horizontal scroll smooth when needed --- */
+    /* --- Tables --- */
     .table-wrap{ overflow-x:auto; -webkit-overflow-scrolling:touch; }
 
-    /* Optional: tighter inputs on phones for nicer form fit */
+    /* --- Inputs on phones --- */
     @media (max-width: 780px){
       input, select, textarea{ padding:10px 12px; }
       .btn{ padding:10px 12px; }
     }
+
+    /* Make all buttons consistent */
+.btn{
+  display:inline-flex; align-items:center; justify-content:center;
+  height:44px; padding:0 14px; font-weight:600;
+  border-radius:12px; /* looks nicer next to inputs */
+}
+
+/* Actions row: Apply + Reset */
+.form-actions{
+  display:flex; gap:8px; align-items:flex-end; /* aligns with inputs nicely */
+}
+.form-actions .btn{
+  min-width:120px; /* same size feel on desktop */
+}
+
+/* Export button block */
+.form-export{
+  display:flex; justify-content:flex-end; align-items:flex-end;
+}
+
+/* Responsive: collapse grid and make buttons equal-width */
+@media (max-width: 960px){
+  .grid.cols-4{ grid-template-columns: 1fr 1fr !important; }
+}
+@media (max-width: 560px){
+  .grid.cols-4{ grid-template-columns: 1fr !important; }
+
+  .form-actions{
+    display:grid; grid-template-columns: 1fr 1fr; gap:10px;
+  }
+  .form-actions .btn{ width:100%; min-width:0; }
+
+  .form-export{ justify-content:stretch; }
+  .form-export .btn{ width:100%; }
+}
+
+/* Bottom action bar on Add/Edit forms */
+.form-actions-bar{
+  display:flex;
+  gap:10px;
+  justify-content:flex-end;
+  align-items:center;
+  margin-top:6px;
+}
+
+/* Make both controls look/feel identical and aligned */
+.form-actions-bar .btn{
+  display:inline-flex;
+  align-items:center;
+  justify-content:center;
+  height:48px;
+  padding:0 18px;
+  font-size:16px;
+  font-weight:700;
+  border-radius:16px;
+  min-width:140px;        /* equal-looking width on desktop */
+}
+
+/* Mobile: two equal full-width buttons */
+@media (max-width: 560px){
+  .form-actions-bar{
+    display:grid;
+    grid-template-columns: 1fr 1fr;
+    gap:12px;
+  }
+  .form-actions-bar .btn{
+    width:100%;
+    min-width:0;          /* let the grid control the width */
+    height:52px;          /* bigger tap target on phones */
+    font-size:17px;
+  }
+}
+
+/* Inline label + full-width file input */
+.field{ display:flex; flex-direction:column; gap:6px; }
+.muted{ color:#9fb0d3; opacity:.85; font-weight:500; }
+
+/* On phones, make the receipt row two columns: label | input */
+/* Utility: make an element span both columns of the form grid */
+/* Utility: span a field across both columns of the .grid.cols-2 form */
+.span-2 { grid-column: 1 / -1; }
+
+/* Mobile: label on top, file input underneath, full width */
+@media (max-width: 780px){
+  .receipt-row{
+    display:flex !important;
+    flex-direction:column;
+    gap:8px;
+  }
+}
+
+
+/* Ensure the file control fills the available space */
+.file-control{
+  display:flex;
+  align-items:center;
+  border:1px solid #2c3e70;
+  background:#0f1530;
+  border-radius:12px;
+  padding:8px 10px;
+  width:100%;
+  min-width:0;        /* prevents overflow in grid/flex */
+  box-sizing:border-box;
+}
+
+.file-input{
+  width:100%;
+  min-width:0;
+  color:#e6eefc;
+  background:transparent;
+  border:0;           /* remove inner border; outer .file-control provides it */
+}
+
+/* Style the native upload button consistently */
+.file-input::file-selector-button,
+.file-input::-webkit-file-upload-button{
+  height:36px; padding:0 12px; margin-right:10px;
+  border-radius:10px; border:1px solid #2c3e70;
+  background:#18224a; color:#e6eefc; cursor:pointer;
+}
+
+
   </style>
+
 </head>
 <body>
   <div class="container">
