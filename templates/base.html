@@ -12,73 +12,69 @@
   <!-- Your app-wide CSS from app.py -->
   <style>{{ css }}</style>
 
-  <!-- Responsive navbar + consistent button sizing -->
+  <!-- Mobile-first layout fixes -->
   <style>
-    /* NAV LAYOUT */
+    /* Respect iOS safe-area (Dynamic Island / notch) */
+    body { padding-top: max(0px, env(safe-area-inset-top)); }
+
+    /* --- NAV: space, equal sizing, and clean wrapping on phones --- */
     .navbar{
-      display:flex;
-      align-items:center;
-      justify-content:space-between;
-      gap:.75rem;
-      flex-wrap:wrap;           /* allow wrap when vertical space is tight */
-      margin-bottom:18px;
+      display:flex; align-items:center; justify-content:space-between;
+      gap:.75rem; flex-wrap:wrap; margin-bottom:18px;
     }
-    .nav-brand{
-      font-weight:800; font-size:20px; letter-spacing:.3px;
-      white-space:nowrap;
-      flex:0 0 auto;
-    }
-    .nav-actions{
-      display:flex;
-      flex-wrap:wrap;
-      gap:.5rem;
-      justify-content:flex-end;
-      flex:1 1 auto;
-      min-width:260px;
-    }
+    .nav-brand{ font-weight:800; font-size:20px; letter-spacing:.3px; white-space:nowrap; }
+    .nav-actions{ display:flex; flex-wrap:wrap; gap:.5rem .5rem; }
 
-    /* CONSISTENT BUTTONS */
+    /* Make all top buttons the same height & nicely padded */
     .nav-actions .btn{
-      display:inline-flex;
-      align-items:center;
-      justify-content:center;
-      height:40px;              /* unified height */
-      padding:0 14px;           /* vertical padding now handled by height */
-      font-size:14px;
-      font-weight:600;
-      border-radius:10px;
-      min-width:120px;          /* don't get too tiny on medium screens */
+      display:inline-flex; align-items:center; justify-content:center;
+      height:44px; padding:0 14px; font-size:15px; font-weight:600; border-radius:12px;
     }
 
-    /* When the viewport is narrow (or very short), switch to a grid of equal tiles */
+    /* Phone layout: turn buttons into a tidy grid with breathing room */
     @media (max-width: 780px){
-      .navbar{
-        position:sticky; top:0; z-index:20; background:var(--bg);
-        padding-top:6px; padding-bottom:4px;
-      }
+      .navbar{ position:sticky; top:0; z-index:20; background:var(--bg); padding-top:6px; padding-bottom:6px; }
       .nav-actions{
-        display:grid;
-        grid-template-columns: repeat(2, minmax(0, 1fr)); /* 2 per row */
-        gap:.5rem;
-        width:100%;
+        display:grid; grid-template-columns: repeat(2, minmax(0,1fr));
+        gap:.6rem; width:100%;
       }
-      .nav-actions .btn{
-        width:100%;              /* equal width tiles */
-        min-width:0;
-        height:42px;
-      }
+      .nav-actions .btn{ width:100%; min-width:0; height:46px; }
       .nav-brand{ font-size:18px; }
     }
-
-    /* Super small phones: stack into 1 column */
     @media (max-width: 420px){
-      .nav-actions{
-        grid-template-columns: 1fr;
-      }
+      .nav-actions{ grid-template-columns: 1fr; } /* one per row on very small phones */
     }
 
-    /* Safety net for wide tables on short screens */
+    /* --- KPIs: add a touch more spacing on phones --- */
+    @media (max-width: 780px){
+      .kpis{ gap:10px; }
+      .kpi .value{ font-size:22px; }
+    }
+
+    /* --- Top 5 Categories: convert the inline 5-column grid to a responsive masonry-like grid --- */
+    /* The container immediately after the "Top 5 Categories" title is that grid. */
+    .section-title + div{
+      display:grid !important;
+      grid-template-columns: repeat(auto-fit, minmax(140px, 1fr)) !important;
+      gap:10px !important;
+    }
+    .section-title + div .card{
+      padding:12px !important;
+      display:flex; flex-direction:column; gap:4px;
+      align-items:flex-start; justify-content:center;
+      min-height:64px;
+    }
+    .section-title + div .card div:first-child{ font-size:12px; opacity:.85; }
+    .section-title + div .card div:last-child{ font-weight:800; font-size:16px; }
+
+    /* --- Tables: keep horizontal scroll smooth when needed --- */
     .table-wrap{ overflow-x:auto; -webkit-overflow-scrolling:touch; }
+
+    /* Optional: tighter inputs on phones for nicer form fit */
+    @media (max-width: 780px){
+      input, select, textarea{ padding:10px 12px; }
+      .btn{ padding:10px 12px; }
+    }
   </style>
 </head>
 <body>
